@@ -1,0 +1,411 @@
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Windows.Forms;
+
+namespace DesktopIconToggle;
+
+internal static class Program
+{
+    [STAThread]
+    static void Main()
+    {
+        ApplicationConfiguration.Initialize();
+        Application.Run(new TrayAppContext());
+    }
+}
+
+public sealed class TrayAppContext : ApplicationContext
+{
+    private readonly NotifyIcon _trayIcon;
+    private readonly HotkeyWindow _hotkeyWindow;
+    private readonly AppConfig _config;
+
+    public TrayAppContext()
+    {
+        _config = AppConfig.Load();
+
+        _hotkeyWindow = new HotkeyWindow();
+        _hotkeyWindow.HotkeyPressed += (_, _) => ToggleDesktopIcons();
+
+        RegisterCurrentHotkey();
+
+        var menu = new ContextMenuStrip();
+
+        menu.Items.Add("切换桌面图标显示/隐藏", null, (_, _) => ToggleDesktopIcons());
+        menu.Items.Add("设置快捷键", null, (_, _) => OpenHotkeySettings());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("退出", null, (_, _) => ExitApp());
+
+        _trayIcon = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = $"桌面图标切换器：{_config.Hotkey}",
+            Visible = true,
+            ContextMenuStrip = menu
+        };
+
+        _trayIcon.DoubleClick += (_, _) => ToggleDesktopIcons();
+    }
+
+    private void RegisterCurrentHotkey()
+    {
+        _hotkeyWindow.UnregisterHotkey();
+
+        if (!_hotkeyWindow.RegisterHotkey(_config.Hotkey))
+        {
+            MessageBox.Show(
+                $"快捷键 {_config.Hotkey} 注册失败，可能已被其他程序占用。",
+                "快捷键注册失败",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning
+            );
+        }
+    }
+
+    private void ToggleDesktopIcons()
+    {
+        bool? isVisible = DesktopIconController.AreDesktopIconsVisible();
+
+        if (isVisible == null)
+        {
+            MessageBox.Show(
+                "没有找到桌面图标窗口。请确认 Explorer 正常运行。",
+                "操作失败",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning
+            );
+            return;
+        }
+
+        DesktopIconController.SetDesktopIconsVisible(!isVisible.Value);
+    }
+
+    private void OpenHotkeySettings()
+    {
+        using var form = new HotkeySettingsForm(_config.Hotkey);
+
+        if (form.ShowDialog() == DialogResult.OK && form.SelectedHotkey != null)
+        {
+            _config.Hotkey = form.SelectedHotkey;
+            _config.Save();
+
+            RegisterCurrentHotkey();
+
+            _trayIcon.Text = $"桌面图标切换器：{_config.Hotkey}";
+        }
+    }
+
+    private void ExitApp()
+    {
+        _trayIcon.Visible = false;
+        _trayIcon.Dispose();
+        _hotkeyWindow.UnregisterHotkey();
+        _hotkeyWindow.DestroyHandle();
+        Application.Exit();
+    }
+}
+
+public static class DesktopIconController
+{
+    private const int SW_HIDE = 0;
+    private const int SW_SHOW = 5;
+
+    public static bool? AreDesktopIconsVisible()
+    {
+        IntPtr listView = GetDesktopListView();
+        if (listView == IntPtr.Zero) return null;
+
+        return IsWindowVisible(listView);
+    }
+
+    public static void SetDesktopIconsVisible(bool visible)
+    {
+        IntPtr listView = GetDesktopListView();
+        if (listView == IntPtr.Zero) return;
+
+        ShowWindow(listView, visible ? SW_SHOW : SW_HIDE);
+    }
+
+    private static IntPtr GetDesktopListView()
+    {
+        // 常见路径：Progman -> SHELLDLL_DefView -> SysListView32
+        IntPtr progman = FindWindow("Progman", null);
+        IntPtr defView = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+
+        if (defView != IntPtr.Zero)
+        {
+            IntPtr listView = FindWindowEx(defView, IntPtr.Zero, "SysListView32", null);
+            if (listView != IntPtr.Zero) return listView;
+        }
+
+        // Windows 10 / 11 多数情况下可能在 WorkerW 下
+        IntPtr result = IntPtr.Zero;
+
+        EnumWindows((topHandle, _) =>
+        {
+            IntPtr workerDefView = FindWindowEx(topHandle, IntPtr.Zero, "SHELLDLL_DefView", null);
+            if (workerDefView != IntPtr.Zero)
+            {
+                IntPtr listView = FindWindowEx(workerDefView, IntPtr.Zero, "SysListView32", null);
+                if (listView != IntPtr.Zero)
+                {
+                    result = listView;
+                    return false;
+                }
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return result;
+    }
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(
+        IntPtr hwndParent,
+        IntPtr hwndChildAfter,
+        string? lpszClass,
+        string? lpszWindow
+    );
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+}
+
+public sealed class HotkeyWindow : NativeWindow
+{
+    private const int WM_HOTKEY = 0x0312;
+    private const int HOTKEY_ID = 1001;
+
+    private const uint MOD_ALT = 0x0001;
+    private const uint MOD_CONTROL = 0x0002;
+    private const uint MOD_SHIFT = 0x0004;
+    private const uint MOD_WIN = 0x0008;
+    private const uint MOD_NOREPEAT = 0x4000;
+
+    private bool _registered;
+
+    public event EventHandler? HotkeyPressed;
+
+    public HotkeyWindow()
+    {
+        CreateHandle(new CreateParams());
+    }
+
+    public bool RegisterHotkey(Hotkey hotkey)
+    {
+        uint modifiers = MOD_NOREPEAT;
+
+        if (hotkey.Control) modifiers |= MOD_CONTROL;
+        if (hotkey.Alt) modifiers |= MOD_ALT;
+        if (hotkey.Shift) modifiers |= MOD_SHIFT;
+        if (hotkey.Win) modifiers |= MOD_WIN;
+
+        bool ok = RegisterHotKey(Handle, HOTKEY_ID, modifiers, (uint)hotkey.Key);
+        _registered = ok;
+        return ok;
+    }
+
+    public void UnregisterHotkey()
+    {
+        if (_registered)
+        {
+            UnregisterHotKey(Handle, HOTKEY_ID);
+            _registered = false;
+        }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_HOTKEY)
+        {
+            HotkeyPressed?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        base.WndProc(ref m);
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+}
+
+public sealed class HotkeySettingsForm : Form
+{
+    private readonly TextBox _textBox;
+    private readonly Button _okButton;
+
+    public Hotkey? SelectedHotkey { get; private set; }
+
+    public HotkeySettingsForm(Hotkey current)
+    {
+        Text = "设置快捷键";
+        Width = 360;
+        Height = 160;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        var label = new Label
+        {
+            Text = "请按下新的快捷键，例如 Ctrl + Alt + D：",
+            Left = 20,
+            Top = 20,
+            Width = 300
+        };
+
+        _textBox = new TextBox
+        {
+            Left = 20,
+            Top = 50,
+            Width = 300,
+            ReadOnly = true,
+            Text = current.ToString()
+        };
+
+        _textBox.KeyDown += TextBox_KeyDown;
+
+        _okButton = new Button
+        {
+            Text = "确定",
+            Left = 160,
+            Top = 85,
+            Width = 75,
+            DialogResult = DialogResult.OK
+        };
+
+        var cancelButton = new Button
+        {
+            Text = "取消",
+            Left = 245,
+            Top = 85,
+            Width = 75,
+            DialogResult = DialogResult.Cancel
+        };
+
+        Controls.Add(label);
+        Controls.Add(_textBox);
+        Controls.Add(_okButton);
+        Controls.Add(cancelButton);
+
+        AcceptButton = _okButton;
+        CancelButton = cancelButton;
+
+        SelectedHotkey = current;
+    }
+
+    private void TextBox_KeyDown(object? sender, KeyEventArgs e)
+    {
+        e.SuppressKeyPress = true;
+
+        Keys key = e.KeyCode;
+
+        if (key is Keys.ControlKey or Keys.Menu or Keys.ShiftKey or Keys.LWin or Keys.RWin)
+            return;
+
+        bool ctrl = e.Control;
+        bool alt = e.Alt;
+        bool shift = e.Shift;
+        bool win = (e.Modifiers & Keys.LWin) == Keys.LWin || (e.Modifiers & Keys.RWin) == Keys.RWin;
+
+        if (!ctrl && !alt && !shift && !win)
+        {
+            MessageBox.Show("建议至少包含 Ctrl / Alt / Shift / Win 中的一个修饰键。");
+            return;
+        }
+
+        SelectedHotkey = new Hotkey
+        {
+            Key = key,
+            Control = ctrl,
+            Alt = alt,
+            Shift = shift,
+            Win = win
+        };
+
+        _textBox.Text = SelectedHotkey.ToString();
+    }
+}
+
+public sealed class AppConfig
+{
+    public Hotkey Hotkey { get; set; } = new()
+    {
+        Control = true,
+        Alt = true,
+        Shift = false,
+        Win = false,
+        Key = Keys.D
+    };
+
+    private static string ConfigDir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DesktopIconToggle");
+
+    private static string ConfigPath => Path.Combine(ConfigDir, "config.json");
+
+    public static AppConfig Load()
+    {
+        try
+        {
+            if (!File.Exists(ConfigPath))
+                return new AppConfig();
+
+            string json = File.ReadAllText(ConfigPath);
+            return JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
+        }
+        catch
+        {
+            return new AppConfig();
+        }
+    }
+
+    public void Save()
+    {
+        Directory.CreateDirectory(ConfigDir);
+
+        var json = JsonSerializer.Serialize(this, new JsonSerializerOptions
+        {
+            WriteIndented = true
+        });
+
+        File.WriteAllText(ConfigPath, json);
+    }
+}
+
+public sealed class Hotkey
+{
+    public bool Control { get; set; }
+    public bool Alt { get; set; }
+    public bool Shift { get; set; }
+    public bool Win { get; set; }
+    public Keys Key { get; set; }
+
+    public override string ToString()
+    {
+        var parts = new List<string>();
+
+        if (Control) parts.Add("Ctrl");
+        if (Alt) parts.Add("Alt");
+        if (Shift) parts.Add("Shift");
+        if (Win) parts.Add("Win");
+
+        parts.Add(Key.ToString());
+
+        return string.Join(" + ", parts);
+    }
+}
